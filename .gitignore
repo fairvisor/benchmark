@@ -1,0 +1,5 @@
+fairvisor-bench.log
+/tmp/fv-bench/
+*.log
+results/*.json
+!results/reference.json

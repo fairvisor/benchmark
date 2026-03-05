@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "date": "2026-03-04",
+    "instance": "c7i.2xlarge",
+    "vcpu": 8,
+    "ram_gb": 16,
+    "os": "Ubuntu 24.04.3 LTS",
+    "k6": "v0.54.0",
+    "rps_latency": 10000,
+    "duration_s": 60,
+    "warmup_s": 10,
+    "cpu_pinning": "openresty=0-3, k6=4-7"
+  },
+  "latency_us": {
+    "decision_service": { "p50": 112, "p90": 191, "p99": 426, "p999": 2990 },
+    "reverse_proxy":    { "p50": 241, "p90": 376, "p99": 822, "p999": 2980 },
+    "raw_nginx":        { "p50":  71, "p90": 190, "p99": 446, "p999": 1610 }
+  },
+  "throughput_rps": {
+    "simple":  110500,
+    "complex":  67600,
+    "llm":      49400
+  }
+}
