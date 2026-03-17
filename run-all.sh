@@ -299,11 +299,19 @@ ensure_k6() {
         return 0
     fi
 
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) die "Unsupported architecture for k6 install: ${arch}" ;;
+    esac
+
     log "Installing k6 ${K6_VER} …"
     curl -fsSL \
-        "https://github.com/grafana/k6/releases/download/${K6_VER}/k6-${K6_VER}-linux-amd64.tar.gz" \
+        "https://github.com/grafana/k6/releases/download/${K6_VER}/k6-${K6_VER}-linux-${arch}.tar.gz" \
         | sudo tar xz -C /usr/local/bin --strip-components=1 \
-            "k6-${K6_VER}-linux-amd64/k6"
+            "k6-${K6_VER}-linux-${arch}/k6"
     ok "k6 $(k6 version | head -1)"
 }
 
@@ -449,7 +457,7 @@ EOF
         },
         {
           "name": "loop-detect",
-          "algorithm": "loop_detection",
+          "algorithm": "loop_detector",
           "algorithm_config": {
             "enabled": true,
             "window_seconds": 60,

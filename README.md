@@ -47,6 +47,7 @@ Meaning of the variables:
 - `FAIRVISOR_REMOTE`: SSH target for the Fairvisor host
 - `LOADGEN_REMOTE`: SSH target for the k6 load-generator host
 - `FAIRVISOR_TARGET_HOST`: IP or DNS name that the load-generator host should use for HTTP traffic to Fairvisor
+- `SSH_OPTS`: optional extra `ssh/scp` flags used by the controller, for example `-o StrictHostKeyChecking=accept-new`
 
 What the controller does:
 
@@ -57,6 +58,15 @@ What the controller does:
 - pulls raw k6 result JSON files back to the local controller for summary rendering
 
 `FAIRVISOR_TARGET_HOST` is optional if the SSH hostname of `FAIRVISOR_REMOTE` is also the correct network address from the load-generator host.
+
+On a first-time connection, prefer setting `SSH_OPTS` so the controller does not block on host key confirmation:
+
+```bash
+SSH_OPTS="-o StrictHostKeyChecking=accept-new" \
+FAIRVISOR_REMOTE=ubuntu@fairvisor-host \
+LOADGEN_REMOTE=ubuntu@loadgen-host \
+bash run-all.sh
+```
 
 ### Local single-host fallback
 
