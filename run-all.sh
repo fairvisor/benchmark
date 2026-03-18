@@ -56,8 +56,8 @@ if [[ -n "${TASKSET_BIN}" && "${CPU_CORES}" -ge 8 ]]; then
     : "${K6_CPUSET:="$((CPU_CORES/2))-$((CPU_CORES - 1))"}"
 fi
 
-# Throughput search upper bounds — RPS hint for binary-search; update after a reference run
-declare -A TGT_T=(['simple']=110500 ['complex']=67600 ['llm']=49400)
+# Throughput search baseline — set THROUGHPUT_SEARCH_MAX to override (default: 150000 RPS)
+: "${THROUGHPUT_SEARCH_MAX:=150000}"
 
 # Measured results (filled in at runtime)
 declare -A LAT_D LAT_P LAT_N
@@ -1008,22 +1008,22 @@ controller_benchmark() {
     banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy simple.json
-    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput simple "${fv_url}/" "" "" "${TGT_T[simple]}"
-    controller_fetch_best_throughput "simple" "${TGT_T[simple]}"
+    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput simple "${fv_url}/" "" "" "${THROUGHPUT_SEARCH_MAX}"
+    controller_fetch_best_throughput "simple" "${THROUGHPUT_SEARCH_MAX}"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 
     banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy complex.json
-    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput complex "${fv_url}/" "${jwt}" "" "${TGT_T[complex]}"
-    controller_fetch_best_throughput "complex" "${TGT_T[complex]}"
+    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput complex "${fv_url}/" "${jwt}" "" "${THROUGHPUT_SEARCH_MAX}"
+    controller_fetch_best_throughput "complex" "${THROUGHPUT_SEARCH_MAX}"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 
     banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy llm.json
-    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${TGT_T[llm]}"
-    controller_fetch_best_throughput "llm" "${TGT_T[llm]}"
+    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${THROUGHPUT_SEARCH_MAX}"
+    controller_fetch_best_throughput "llm" "${THROUGHPUT_SEARCH_MAX}"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 }
 
@@ -1094,22 +1094,22 @@ local_single_host_main() {
     banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
     start_backend
     start_fairvisor reverse_proxy "${pd}/simple.json"
-    helper_run_throughput simple "${fv_url}/" "" "" "${TGT_T[simple]}"
-    controller_fetch_best_throughput_local simple "${TGT_T[simple]}"
+    helper_run_throughput simple "${fv_url}/" "" "" "${THROUGHPUT_SEARCH_MAX}"
+    controller_fetch_best_throughput_local simple "${THROUGHPUT_SEARCH_MAX}"
     stop_all
 
     banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
     start_backend
     start_fairvisor reverse_proxy "${pd}/complex.json"
-    helper_run_throughput complex "${fv_url}/" "${jwt}" "" "${TGT_T[complex]}"
-    controller_fetch_best_throughput_local complex "${TGT_T[complex]}"
+    helper_run_throughput complex "${fv_url}/" "${jwt}" "" "${THROUGHPUT_SEARCH_MAX}"
+    controller_fetch_best_throughput_local complex "${THROUGHPUT_SEARCH_MAX}"
     stop_all
 
     banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
     start_backend
     start_fairvisor reverse_proxy "${pd}/llm.json"
-    helper_run_throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${TGT_T[llm]}"
-    controller_fetch_best_throughput_local llm "${TGT_T[llm]}"
+    helper_run_throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${THROUGHPUT_SEARCH_MAX}"
+    controller_fetch_best_throughput_local llm "${THROUGHPUT_SEARCH_MAX}"
     stop_all
 
     print_results "single-host"
