@@ -57,12 +57,12 @@ if [[ -n "${TASKSET_BIN}" && "${CPU_CORES}" -ge 8 ]]; then
 fi
 
 # Published targets (μs) — reference run: c7i.2xlarge, Ubuntu 24.04.3 LTS
-declare -A TGT_D=([p50]=112  [p90]=191  [p99]=426  [p999]=2990)
-declare -A TGT_P=([p50]=241  [p90]=376  [p99]=822  [p999]=2980)
-declare -A TGT_N=([p50]=71   [p90]=190  [p99]=446  [p999]=1610)
+declare -A TGT_D=(['p50']=112  ['p90']=191  ['p99']=426  ['p999']=2990)
+declare -A TGT_P=(['p50']=241  ['p90']=376  ['p99']=822  ['p999']=2980)
+declare -A TGT_N=(['p50']=71   ['p90']=190  ['p99']=446  ['p999']=1610)
 
 # Published max RPS — reference run: c7i.2xlarge, Ubuntu 24.04.3 LTS
-declare -A TGT_T=([simple]=110500 [complex]=67600 [llm]=49400)
+declare -A TGT_T=(['simple']=110500 ['complex']=67600 ['llm']=49400)
 
 # Measured results (filled in at runtime)
 declare -A LAT_D LAT_P LAT_N
@@ -1281,3 +1281,4 @@ main() {
 }
 
 main "$@"
+
