@@ -474,41 +474,7 @@ EOF
 }
 EOF
 
-    cat > "${pd}/llm.json" <<EOF
-{
-  "bundle_version": 1,
-  "issued_at": "2026-01-01T00:00:00Z",
-  "expires_at": "2030-01-01T00:00:00Z",
-  "jwt_keys": [{ "id": "bench", "algorithm": "HS256", "secret": "${JWT_SECRET}" }],
-  "policies": [{
-    "id": "bench-llm",
-    "spec": {
-      "selector": { "pathPrefix": "/", "methods": ["GET","POST"] },
-      "mode": "enforce",
-      "rules": [{
-        "name": "org-tpm",
-        "limit_keys": ["jwt:org_id"],
-        "algorithm": "token_bucket_llm",
-        "algorithm_config": {
-          "algorithm": "token_bucket_llm",
-          "tokens_per_minute": 99999999999,
-          "tokens_per_day": 99999999999999,
-          "burst_tokens": 99999999999,
-          "default_max_completion": 1024,
-          "token_source": { "estimator": "simple_word" },
-          "_tpm_bucket_config": {
-            "tokens_per_second": 1666666666.65,
-            "burst": 99999999999
-          }
-        }
-      }]
-    }
-  }],
-  "kill_switches": []
-}
-EOF
-
-    ok "Policies: simple  complex  llm"
+    ok "Policies: simple  complex"
 }
 
 ##############################################################################
@@ -977,54 +943,46 @@ controller_fetch_best_throughput() {
 }
 
 controller_benchmark() {
-    local jwt pd fv_url nginx_url decision_url llm_body
+    local jwt pd fv_url nginx_url decision_url
     jwt="$(gen_jwt)"
     pd="${BENCH_DIR}/policies"
     fv_url="http://${FAIRVISOR_TARGET_HOST}:${FV_PORT}"
     nginx_url="http://${FAIRVISOR_TARGET_HOST}:${NGINX_PORT}"
     decision_url="${fv_url}/v1/decision"
-    llm_body='{"model":"gpt-4o","messages":[{"role":"user","content":"Hello, this is a benchmark test message for token estimation."}]}'
 
-    banner "TEST 1/6 — Raw nginx baseline (latency)"
+    banner "TEST 1/5 — Raw nginx baseline (latency)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start baseline
     remote_helper "${LOADGEN_REMOTE}" helper-run-latency nginx "${nginx_url}/" "" get
     controller_fetch_latency "nginx" "LAT_N"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 
-    banner "TEST 2/6 — Fairvisor decision_service (latency)"
+    banner "TEST 2/5 — Fairvisor decision_service (latency)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor decision_service simple.json
     remote_helper "${LOADGEN_REMOTE}" helper-run-latency decision "${decision_url}" "${jwt}" decision
     controller_fetch_latency "decision" "LAT_D"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 
-    banner "TEST 3/6 — Fairvisor reverse_proxy (latency)"
+    banner "TEST 3/5 — Fairvisor reverse_proxy (latency)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy simple.json
     remote_helper "${LOADGEN_REMOTE}" helper-run-latency proxy "${fv_url}/" "${jwt}" get
     controller_fetch_latency "proxy" "LAT_P"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 
-    banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
+    banner "TEST 4/5 — Max throughput: simple rate limit (1 rule)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy simple.json
     remote_helper "${LOADGEN_REMOTE}" helper-run-throughput simple "${fv_url}/" "" "" "${THROUGHPUT_SEARCH_MAX}"
     controller_fetch_best_throughput "simple" "${THROUGHPUT_SEARCH_MAX}"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 
-    banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
+    banner "TEST 5/5 — Max throughput: complex policy (5 rules + JWT + loop)"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
     remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy complex.json
     remote_helper "${LOADGEN_REMOTE}" helper-run-throughput complex "${fv_url}/" "${jwt}" "" "${THROUGHPUT_SEARCH_MAX}"
     controller_fetch_best_throughput "complex" "${THROUGHPUT_SEARCH_MAX}"
-    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
-
-    banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
-    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
-    remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy llm.json
-    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${THROUGHPUT_SEARCH_MAX}"
-    controller_fetch_best_throughput "llm" "${THROUGHPUT_SEARCH_MAX}"
     remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
 }
 
@@ -1063,15 +1021,14 @@ local_single_host_main() {
     setup_fairvisor
     create_policies
 
-    local jwt pd fv_url nginx_url decision_url llm_body s_lat s_warmup
+    local jwt pd fv_url nginx_url decision_url s_lat s_warmup
     jwt="$(gen_jwt)"
     pd="${BENCH_DIR}/policies"
     fv_url="http://127.0.0.1:${FV_PORT}"
     nginx_url="http://127.0.0.1:${NGINX_PORT}"
     decision_url="${fv_url}/v1/decision"
-    llm_body='{"model":"gpt-4o","messages":[{"role":"user","content":"Hello, this is a benchmark test message for token estimation."}]}'
 
-    banner "TEST 1/6 — Raw nginx baseline (latency)"
+    banner "TEST 1/5 — Raw nginx baseline (latency)"
     start_baseline
     s_lat=$(write_latency_js "lat_nginx" "${nginx_url}/" "${LATENCY_RPS}" "${LATENCY_DUR}" "" get)
     s_warmup=$(write_warmup_js "lat_nginx" "${nginx_url}/" "")
@@ -1079,38 +1036,31 @@ local_single_host_main() {
     _parse_latency "${BENCH_DIR}/results/lat_nginx.json" "LAT_N"
     stop_all
 
-    banner "TEST 2/6 — Fairvisor decision_service (latency)"
+    banner "TEST 2/5 — Fairvisor decision_service (latency)"
     start_fairvisor decision_service "${pd}/simple.json"
     helper_run_latency decision "${decision_url}" "${jwt}" decision >/dev/null 2>&1 || true
     _parse_latency "${BENCH_DIR}/results/lat_decision.json" "LAT_D"
     stop_all
 
-    banner "TEST 3/6 — Fairvisor reverse_proxy (latency)"
+    banner "TEST 3/5 — Fairvisor reverse_proxy (latency)"
     start_backend
     start_fairvisor reverse_proxy "${pd}/simple.json"
     helper_run_latency proxy "${fv_url}/" "${jwt}" get >/dev/null 2>&1 || true
     _parse_latency "${BENCH_DIR}/results/lat_proxy.json" "LAT_P"
     stop_all
 
-    banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
+    banner "TEST 4/5 — Max throughput: simple rate limit (1 rule)"
     start_backend
     start_fairvisor reverse_proxy "${pd}/simple.json"
     helper_run_throughput simple "${fv_url}/" "" "" "${THROUGHPUT_SEARCH_MAX}"
     controller_fetch_best_throughput_local simple "${THROUGHPUT_SEARCH_MAX}"
     stop_all
 
-    banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
+    banner "TEST 5/5 — Max throughput: complex policy (5 rules + JWT + loop)"
     start_backend
     start_fairvisor reverse_proxy "${pd}/complex.json"
     helper_run_throughput complex "${fv_url}/" "${jwt}" "" "${THROUGHPUT_SEARCH_MAX}"
     controller_fetch_best_throughput_local complex "${THROUGHPUT_SEARCH_MAX}"
-    stop_all
-
-    banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
-    start_backend
-    start_fairvisor reverse_proxy "${pd}/llm.json"
-    helper_run_throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${THROUGHPUT_SEARCH_MAX}"
-    controller_fetch_best_throughput_local llm "${THROUGHPUT_SEARCH_MAX}"
     stop_all
 
     print_results "single-host"
@@ -1193,7 +1143,6 @@ print_results() {
     local thr_rows=(
         "simple:Simple rate limit (1 rule)"
         "complex:Complex policy (5 rules, JWT + loop detection)"
-        "llm:With token estimation (tiktoken)"
     )
     for row in "${thr_rows[@]}"; do
         IFS=: read -r key lbl <<< "${row}"
