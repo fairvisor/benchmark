@@ -56,12 +56,7 @@ if [[ -n "${TASKSET_BIN}" && "${CPU_CORES}" -ge 8 ]]; then
     : "${K6_CPUSET:="$((CPU_CORES/2))-$((CPU_CORES - 1))"}"
 fi
 
-# Published targets (μs) — reference run: c7i.2xlarge, Ubuntu 24.04.3 LTS
-declare -A TGT_D=(['p50']=112  ['p90']=191  ['p99']=426  ['p999']=2990)
-declare -A TGT_P=(['p50']=241  ['p90']=376  ['p99']=822  ['p999']=2980)
-declare -A TGT_N=(['p50']=71   ['p90']=190  ['p99']=446  ['p999']=1610)
-
-# Published max RPS — reference run: c7i.2xlarge, Ubuntu 24.04.3 LTS
+# Throughput search upper bounds — RPS hint for binary-search; update after a reference run
 declare -A TGT_T=(['simple']=110500 ['complex']=67600 ['llm']=49400)
 
 # Measured results (filled in at runtime)
@@ -1152,25 +1147,6 @@ _us() {
     fi
 }
 
-_col_lat() {
-    local got="$1" tgt="$2"
-    [[ "${got}" == "N/A" ]] && echo "${YLW}" && return
-    local ok110 ok130
-    ok110=$(printf '%.0f' "$(echo "${tgt}*1.10" | bc -l)")
-    ok130=$(printf '%.0f' "$(echo "${tgt}*1.30" | bc -l)")
-    (( got <= ok110 )) && echo "${GRN}" && return
-    (( got <= ok130 )) && echo "${YLW}" && return
-    echo "${RED}"
-}
-
-_col_thr() {
-    local got="$1" tgt="$2"
-    [[ "${got}" == "N/A" || "${got}" == "0" ]] && echo "${YLW}" && return
-    local ok90
-    ok90=$(printf '%.0f' "$(echo "${tgt}*0.90" | bc -l)")
-    (( got >= ok90 )) && echo "${GRN}" || echo "${RED}"
-}
-
 print_results() {
     local mode_label="${1:-single-host}"
     local w=82 hr hr2
@@ -1183,56 +1159,48 @@ print_results() {
     echo -e "${BOLD}${hr}${RST}"
 
     echo ""
-    echo -e "${BOLD}  Latency @ ${LATENCY_RPS} RPS steady state${RST}  ${DIM}(target: fairvisor/edge README)${RST}"
+    echo -e "${BOLD}  Latency @ ${LATENCY_RPS} RPS steady state${RST}"
     echo ""
-    printf "  ${BOLD}%-8s  %-26s  %-26s  %-20s${RST}\n" \
-        "Pct" "Decision Service" "Reverse Proxy" "Raw nginx"
-    printf "  %-8s  %-26s  %-26s  %-20s\n" \
-        "────────" "${hr2:0:24}" "${hr2:0:24}" "${hr2:0:18}"
+    printf "  ${BOLD}%-8s  %-14s  %-14s  %-14s${RST}\n" \
+        "Pct" "Decision Svc" "Reverse Proxy" "Raw nginx"
+    printf "  %-8s  %-14s  %-14s  %-14s\n" \
+        "────────" "──────────────" "──────────────" "──────────────"
 
-    local rows=("p50:p50:112:241:71" "p90:p90:191:376:190" "p99:p99:426:822:446" "p99.9:p999:2990:2980:1610")
+    local rows=("p50:p50" "p90:p90" "p99:p99" "p99.9:p999")
     local row
     for row in "${rows[@]}"; do
-        IFS=: read -r lbl key td tp tn <<< "${row}"
+        IFS=: read -r lbl key <<< "${row}"
 
-        local gd gp gn fd fp fn cd cp cn
+        local gd gp gn
         eval "gd=\${LAT_D[${key}]:-N/A}"
         eval "gp=\${LAT_P[${key}]:-N/A}"
         eval "gn=\${LAT_N[${key}]:-N/A}"
 
-        [[ "${gd}" == "N/A" ]] && fd="N/A (tgt: $(_us "$td"))" || fd="$(_us "$gd") (tgt: $(_us "$td"))"
-        [[ "${gp}" == "N/A" ]] && fp="N/A (tgt: $(_us "$tp"))" || fp="$(_us "$gp") (tgt: $(_us "$tp"))"
-        [[ "${gn}" == "N/A" ]] && fn="N/A (tgt: $(_us "$tn"))" || fn="$(_us "$gn") (tgt: $(_us "$tn"))"
+        [[ "${gd}" != "N/A" ]] && gd="$(_us "${gd}")"
+        [[ "${gp}" != "N/A" ]] && gp="$(_us "${gp}")"
+        [[ "${gn}" != "N/A" ]] && gn="$(_us "${gn}")"
 
-        [[ "${gd}" == "N/A" ]] && cd="${YLW}" || cd=$(_col_lat "${gd}" "${td}")
-        [[ "${gp}" == "N/A" ]] && cp="${YLW}" || cp=$(_col_lat "${gp}" "${tp}")
-        [[ "${gn}" == "N/A" ]] && cn="${YLW}" || cn=$(_col_lat "${gn}" "${tn}")
-
-        printf "  %-8s  ${cd}%-26s${RST}  ${cp}%-26s${RST}  ${cn}%-20s${RST}\n" \
-            "${lbl}" "${fd}" "${fp}" "${fn}"
+        printf "  %-8s  %-14s  %-14s  %-14s\n" "${lbl}" "${gd}" "${gp}" "${gn}"
     done
 
     echo ""
     echo -e "${BOLD}  Max Sustained Throughput — single fairvisor instance${RST}"
     echo ""
-    printf "  ${BOLD}%-48s  %-14s  %-14s${RST}\n" "Configuration" "Measured RPS" "Target RPS"
-    printf "  %-48s  %-14s  %-14s\n" "${hr2:0:48}" "──────────────" "──────────────"
+    printf "  ${BOLD}%-48s  %-14s${RST}\n" "Configuration" "Measured RPS"
+    printf "  %-48s  %-14s\n" "${hr2:0:48}" "──────────────"
 
     local thr_rows=(
-        "simple:110500:Simple rate limit (1 rule)"
-        "complex:67600:Complex policy (5 rules, JWT + loop detection)"
-        "llm:49400:With token estimation (tiktoken)"
+        "simple:Simple rate limit (1 rule)"
+        "complex:Complex policy (5 rules, JWT + loop detection)"
+        "llm:With token estimation (tiktoken)"
     )
     for row in "${thr_rows[@]}"; do
-        IFS=: read -r key tgt lbl <<< "${row}"
+        IFS=: read -r key lbl <<< "${row}"
         local got="${THR_RES[${key}]:-N/A}"
-        local col
-        col=$(_col_thr "${got}" "${tgt}")
-        printf "  %-48s  ${col}%-14s${RST}  %-14s\n" "${lbl}" "${got}" "${tgt}"
+        printf "  %-48s  %-14s\n" "${lbl}" "${got}"
     done
 
     echo ""
-    echo -e "  ${DIM}Colour: ${GRN}within 10% of target${RST}${DIM}  ${YLW}within 30% / N/A${RST}${DIM}  ${RED}>30% off${RST}"
     echo -e "${BOLD}${hr}${RST}"
     echo ""
     echo -e "  Local controller artifacts → ${BENCH_DIR}/controller-results/"
