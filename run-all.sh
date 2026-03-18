@@ -57,7 +57,10 @@ if [[ -n "${TASKSET_BIN}" && "${CPU_CORES}" -ge 8 ]]; then
 fi
 
 # Throughput search upper bounds — RPS hint for binary-search; update after a reference run
-declare -A TGT_T=(['simple']=110500 ['complex']=67600 ['llm']=49400)
+declare -A TGT_T
+TGT_T[simple]=110500
+TGT_T[complex]=67600
+TGT_T[llm]=49400
 
 # Measured results (filled in at runtime)
 declare -A LAT_D LAT_P LAT_N
