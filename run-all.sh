@@ -577,10 +577,10 @@ http {
   }
 }
 EOF
-    run_oresty_bg -p "${pfx}" -c "${pfx}/conf/nginx.conf" -g 'daemon off;' \
+    run_oresty_bg -p "${pfx}" -c "${pfx}/conf/nginx.conf" \
         >"${pfx}/logs/stdout.log" 2>"${pfx}/logs/stderr.log"
     _wait_port "${NGINX_PORT}" || {
-        warn "baseline nginx stderr:"; cat "${pfx}/logs/stderr.log" >&2
+        warn "baseline nginx error_log:"; cat "${pfx}/logs/error.log" >&2
         die "baseline nginx failed to start"
     }
     ok "Baseline nginx  :${NGINX_PORT}"
@@ -608,10 +608,10 @@ http {
   }
 }
 EOF
-    run_oresty_bg -p "${pfx}" -c "${pfx}/conf/nginx.conf" -g 'daemon off;' \
+    run_oresty_bg -p "${pfx}" -c "${pfx}/conf/nginx.conf" \
         >"${pfx}/logs/stdout.log" 2>"${pfx}/logs/stderr.log"
     _wait_port "${BACKEND_PORT}" || {
-        warn "backend nginx stderr:"; cat "${pfx}/logs/stderr.log" >&2
+        warn "backend nginx error_log:"; cat "${pfx}/logs/error.log" >&2
         die "backend nginx failed to start"
     }
     ok "Backend nginx    :${BACKEND_PORT}"
@@ -665,7 +665,7 @@ start_fairvisor() {
     done
 
     FAIRVISOR_CONFIG_FILE="${policy}" \
-    run_oresty_bg -p "${pfx}" -c "${pfx}/conf/nginx.conf" -g 'daemon off;' \
+    run_oresty_bg -p "${pfx}" -c "${pfx}/conf/nginx.conf" \
         >"${pfx}/logs/stdout.log" 2>"${pfx}/logs/stderr.log"
 
     _wait_port "${FV_PORT}" || {
