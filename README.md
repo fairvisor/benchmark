@@ -1,6 +1,9 @@
 # Fairvisor Benchmark Suite
 
-Single-script benchmark suite for `fairvisor/edge` with reproducible latency and throughput tests.
+Single-script benchmark suite for `fairvisor/edge` with reproducible latency and throughput tests. The primary workflow is now a local controller that orchestrates two remote Linux hosts:
+
+- one remote Fairvisor host
+- one remote k6 load-generator host
 
 Script: `run-all.sh`
 
@@ -28,23 +31,68 @@ Each run prints a summary table and stores raw artifacts.
 
 ## Quick Start
 
-Run directly on target host:
+### Recommended: local controller + two remote hosts
+
+Run from your local machine:
+
+```bash
+FAIRVISOR_REMOTE=ubuntu@fairvisor-host \
+LOADGEN_REMOTE=ubuntu@loadgen-host \
+FAIRVISOR_TARGET_HOST=10.0.0.42 \
+bash run-all.sh
+```
+
+Meaning of the variables:
+
+- `FAIRVISOR_REMOTE`: SSH target for the Fairvisor host
+- `LOADGEN_REMOTE`: SSH target for the k6 load-generator host
+- `FAIRVISOR_TARGET_HOST`: IP or DNS name that the load-generator host should use for HTTP traffic to Fairvisor
+- `SSH_OPTS`: optional extra `ssh/scp` flags used by the controller, for example `-o StrictHostKeyChecking=accept-new`
+
+What the controller does:
+
+- copies `run-all.sh` to both hosts under `/tmp/fv-bench/`
+- installs only the dependencies each role needs
+- starts/stops baseline nginx, backend nginx, and Fairvisor on the Fairvisor host
+- generates and runs k6 workloads on the load-generator host
+- pulls raw k6 result JSON files back to the local controller for summary rendering
+
+`FAIRVISOR_TARGET_HOST` is optional if the SSH hostname of `FAIRVISOR_REMOTE` is also the correct network address from the load-generator host.
+
+On a first-time connection, prefer setting `SSH_OPTS` so the controller does not block on host key confirmation:
+
+```bash
+SSH_OPTS="-o StrictHostKeyChecking=accept-new" \
+FAIRVISOR_REMOTE=ubuntu@fairvisor-host \
+LOADGEN_REMOTE=ubuntu@loadgen-host \
+bash run-all.sh
+```
+
+### Local single-host fallback
+
+For quick local validation or development:
 
 ```bash
 bash run-all.sh
 ```
 
-Run from local machine and execute remotely:
+This keeps the old single-host behavior where Fairvisor and k6 share one machine.
+
+### Dry-run validation
+
+To validate orchestration commands without touching real hosts:
 
 ```bash
-REMOTE=ubuntu@<host> bash run-all.sh
+DRY_RUN=1 \
+FAIRVISOR_REMOTE=ubuntu@fairvisor-host \
+LOADGEN_REMOTE=ubuntu@loadgen-host \
+FAIRVISOR_TARGET_HOST=10.0.0.42 \
+bash run-all.sh
 ```
 
-When `REMOTE` is set, the script copies itself to `/tmp/fv-bench/run-all.sh`, executes there, and downloads log to `./fairvisor-bench.log`.
+## CPU Pinning
 
-## CPU Pinning (Single-Host Mode)
-
-For setups where SUT and k6 share one host, optional `taskset` pinning is supported.
+For setups where SUT and k6 share one host, optional `taskset` pinning is supported. In remote-controller mode, pinning is applied independently on whichever host is running that role.
 
 - `ORESTY_CPUSET` for OpenResty/backend processes
 - `K6_CPUSET` for k6
@@ -59,16 +107,18 @@ If `taskset` exists and host has `>=8` cores, defaults are auto-split 50/50.
 
 ## Outputs
 
-On target host:
+On the load-generator host:
 
 - Raw k6 summaries: `/tmp/fv-bench/results/`
 - Generated k6 scripts: `/tmp/fv-bench/scripts/`
+
+On the Fairvisor host:
+
 - Service logs: `/tmp/fv-bench/run/*/logs/`
-- Full run log: `/tmp/fv-bench/run-all.log`
 
-Local (when `REMOTE` is used):
+On the local controller:
 
-- Downloaded run log: `./fairvisor-bench.log`
+- Pulled result JSONs: `/tmp/fv-bench/controller-results/`
 
 ## Reference Results
 
@@ -101,12 +151,11 @@ CPU pinning: OpenResty on cores 0–3, k6 on cores 4–7.
 - `decision_service` and `reverse_proxy` are different paths:
   - `decision_service`: decision API only
   - `reverse_proxy`: decision + upstream proxy round-trip
-- In single-host runs, k6 and SUT can contend for CPU unless pinned/separated.
-- For production-like proxy latency, prefer separate load-generator host.
+- In single-host runs, k6 and SUT can contend for CPU unless pinned or separated.
+- The recommended path for production-like proxy latency is the two-host controller mode.
 
 ## Repository
 
 This benchmark suite is intended to be published in:
 
 - `https://github.com/fairvisor/benchmark`
-

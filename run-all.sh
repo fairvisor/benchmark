@@ -2,59 +2,51 @@
 ##############################################################################
 # run-all.sh — Fairvisor Benchmark Suite
 #
-# Installs all dependencies from scratch, runs 6 scenarios, and prints a
-# colour-coded results table vs the published performance targets.
+# Supported modes:
+#   1. Local single-host:
+#        bash run-all.sh
+#   2. Local controller + two remote hosts:
+#        FAIRVISOR_REMOTE=ubuntu@fairvisor \
+#        LOADGEN_REMOTE=ubuntu@loadgen \
+#        FAIRVISOR_TARGET_HOST=10.0.0.42 \
+#        bash run-all.sh
 #
-# Usage
-#   From your local machine:
-#     REMOTE=ec2-user@3.71.33.147 bash run-all.sh
-#   Directly on the target host:
-#     bash run-all.sh
-#
-# Target: 8 vCPU / 16 GB RAM (c7i.2xlarge), Amazon Linux / Ubuntu
-# Fairvisor: github.com/fairvisor/edge  (OpenResty / LuaJIT, no Docker)
+# In remote mode, this script stays on the local machine and orchestrates:
+#   - one remote Fairvisor host (OpenResty + backend + SUT)
+#   - one remote load-generator host (k6 only)
 ##############################################################################
 set -euo pipefail
-
-# ── Self-deploy ───────────────────────────────────────────────────────────────
-if [[ -n "${REMOTE:-}" ]]; then
-    echo "==> Deploying to ${REMOTE} …"
-    ssh "${REMOTE}" "mkdir -p /tmp/fv-bench"
-    scp "$0" "${REMOTE}:/tmp/fv-bench/run-all.sh"
-    ssh -t "${REMOTE}" "bash /tmp/fv-bench/run-all.sh 2>&1 | tee /tmp/fv-bench/run-all.log"
-    scp "${REMOTE}:/tmp/fv-bench/run-all.log" ./fairvisor-bench.log
-    echo "==> Log saved to ./fairvisor-bench.log"
-    exit 0
-fi
 
 ##############################################################################
 # CONFIG
 ##############################################################################
-FV_DIR="/opt/fairvisor"      # clone target — mirrors Docker's /opt/fairvisor
-BENCH_DIR="/tmp/fv-bench"
-K6_VER="v0.54.0"
+FV_DIR="${FV_DIR:-/opt/fairvisor}"
+BENCH_DIR="${BENCH_DIR:-/tmp/fv-bench}"
+K6_VER="${K6_VER:-v0.54.0}"
 
-FV_PORT=8080
-BACKEND_PORT=8081
-NGINX_PORT=8082
+FV_PORT="${FV_PORT:-8080}"
+BACKEND_PORT="${BACKEND_PORT:-8081}"
+NGINX_PORT="${NGINX_PORT:-8082}"
 
-# OpenResty binary — try PATH first, then the default install location
-ORESTY=$(command -v openresty 2>/dev/null \
+LATENCY_RPS="${LATENCY_RPS:-10000}"
+LATENCY_DUR="${LATENCY_DUR:-60}"
+WARMUP_DUR="${WARMUP_DUR:-10}"
+
+FAIRVISOR_REMOTE="${FAIRVISOR_REMOTE:-}"
+LOADGEN_REMOTE="${LOADGEN_REMOTE:-}"
+FAIRVISOR_TARGET_HOST="${FAIRVISOR_TARGET_HOST:-}"
+SSH_OPTS="${SSH_OPTS:-}"
+DRY_RUN="${DRY_RUN:-0}"
+
+# OpenResty binary — try PATH first, then default install locations.
+ORESTY="$(command -v openresty 2>/dev/null \
     || ls /usr/local/openresty/bin/openresty 2>/dev/null \
     || ls /usr/local/openresty/nginx/sbin/nginx 2>/dev/null \
-    || echo openresty)
+    || echo openresty)"
 
-# Safe worker_connections — stay within OS nofile limit
-_NOFILE=$(ulimit -n 2>/dev/null || echo 1024)
+_NOFILE="$(ulimit -n 2>/dev/null || echo 1024)"
 WORKER_CONN=$(( _NOFILE > 4096 ? 4096 : _NOFILE - 1 ))
 
-LATENCY_RPS=10000   # RPS for latency test (README: "at 10 000 RPS steady state")
-LATENCY_DUR=60      # seconds
-WARMUP_DUR=10       # seconds
-
-# Optional CPU pinning for single-host runs (SUT + load generator on same machine).
-# Override via env:
-#   ORESTY_CPUSET=0-3 K6_CPUSET=4-7 bash run-all.sh
 TASKSET_BIN="$(command -v taskset 2>/dev/null || true)"
 CPU_CORES="$(nproc 2>/dev/null || echo 1)"
 ORESTY_CPUSET="${ORESTY_CPUSET:-}"
@@ -75,6 +67,7 @@ declare -A TGT_T=([simple]=110500 [complex]=67600 [llm]=49400)
 # Measured results (filled in at runtime)
 declare -A LAT_D LAT_P LAT_N
 declare -A THR_RES
+declare -a _BGPIDS=()
 
 ##############################################################################
 # OUTPUT
@@ -88,6 +81,97 @@ warn()   { echo -e "${YLW}⚠${RST}  $*"; }
 die()    { echo -e "${RED}✗ FATAL:${RST} $*" >&2; exit 1; }
 banner() { echo -e "\n${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n  $*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"; }
 
+##############################################################################
+# REMOTE ORCHESTRATION HELPERS
+##############################################################################
+remote_mode_enabled() {
+    [[ -n "${FAIRVISOR_REMOTE}" || -n "${LOADGEN_REMOTE}" ]]
+}
+
+infer_target_host() {
+    local remote="$1"
+    local stripped="${remote#*@}"
+    stripped="${stripped%%:*}"
+    echo "${stripped}"
+}
+
+require_remote_config() {
+    [[ -n "${FAIRVISOR_REMOTE}" ]] || die "FAIRVISOR_REMOTE is required in remote mode"
+    [[ -n "${LOADGEN_REMOTE}" ]] || die "LOADGEN_REMOTE is required in remote mode"
+    if [[ -z "${FAIRVISOR_TARGET_HOST}" ]]; then
+        FAIRVISOR_TARGET_HOST="$(infer_target_host "${FAIRVISOR_REMOTE}")"
+    fi
+}
+
+_ssh() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        printf 'DRY_RUN ssh %s %q\n' "$1" "$2"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    ssh ${SSH_OPTS} "$1" "$2"
+}
+
+_scp_to() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        printf 'DRY_RUN scp %q %s:%q\n' "$1" "$2" "$3"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    scp ${SSH_OPTS} "$1" "$2:$3"
+}
+
+_scp_from() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        printf 'DRY_RUN scp %s:%q %q\n' "$1" "$2" "$3"
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    scp ${SSH_OPTS} "$1:$2" "$3"
+}
+
+remote_run() {
+    local host="$1"
+    shift
+    local cmd
+    cmd=$(printf '%q ' "$@")
+    _ssh "${host}" "cd ${BENCH_DIR} && ${cmd}"
+}
+
+remote_helper() {
+    local host="$1"
+    shift
+    remote_run "${host}" env \
+        BENCH_DIR="${BENCH_DIR}" \
+        FV_DIR="${FV_DIR}" \
+        K6_VER="${K6_VER}" \
+        FV_PORT="${FV_PORT}" \
+        BACKEND_PORT="${BACKEND_PORT}" \
+        NGINX_PORT="${NGINX_PORT}" \
+        LATENCY_RPS="${LATENCY_RPS}" \
+        LATENCY_DUR="${LATENCY_DUR}" \
+        WARMUP_DUR="${WARMUP_DUR}" \
+        ORESTY_CPUSET="${ORESTY_CPUSET}" \
+        K6_CPUSET="${K6_CPUSET}" \
+        DRY_RUN="${DRY_RUN}" \
+        bash "${BENCH_DIR}/run-all.sh" "$@"
+}
+
+sync_script_to_remote() {
+    local host="$1"
+    _ssh "${host}" "mkdir -p ${BENCH_DIR}"
+    _scp_to "$0" "${host}" "${BENCH_DIR}/run-all.sh"
+}
+
+fetch_remote_file() {
+    local host="$1" remote_path="$2" local_path="$3"
+    mkdir -p "$(dirname "${local_path}")"
+    _scp_from "${host}" "${remote_path}" "${local_path}"
+}
+
+##############################################################################
+# PACKAGE INSTALLATION
+##############################################################################
 detect_os_id() {
     local os_id=""
     if [[ -r /etc/os-release ]]; then
@@ -123,12 +207,27 @@ pkg_update_index() {
             sudo apt-get update -y
             ;;
         amzn|rhel|centos|fedora)
-            : # dnf can resolve metadata on install
+            :
             ;;
         *)
             die "Unsupported OS '${os_id:-unknown}' for package index update"
             ;;
     esac
+}
+
+ensure_common_tools() {
+    local os_id="$1"
+    local need=()
+    command -v jq  &>/dev/null || need+=(jq)
+    command -v bc  &>/dev/null || need+=(bc)
+    command -v git &>/dev/null || need+=(git)
+    command -v python3 &>/dev/null || need+=(python3)
+    command -v pip3 &>/dev/null || need+=(python3-pip)
+    if [[ ${#need[@]} -gt 0 ]]; then
+        pkg_update_index "${os_id}"
+        pkg_install "${os_id}" "${need[@]}"
+    fi
+    ok "jq bc git python3 pip3"
 }
 
 install_openresty_ubuntu() {
@@ -163,38 +262,19 @@ install_openresty_ubuntu() {
     pkg_install "ubuntu" openresty gettext-base
 }
 
-run_oresty_bg() {
-    if [[ -n "${TASKSET_BIN}" && -n "${ORESTY_CPUSET}" ]]; then
-        taskset -c "${ORESTY_CPUSET}" "${ORESTY}" "$@" &
-    else
-        "${ORESTY}" "$@" &
+ensure_openresty() {
+    local os_id="$1"
+    if command -v openresty &>/dev/null; then
+        ok "OpenResty already present"
+        return 0
     fi
-    _BGPIDS+=($!)
-}
 
-k6_run() {
-    if [[ -n "${TASKSET_BIN}" && -n "${K6_CPUSET}" ]]; then
-        taskset -c "${K6_CPUSET}" k6 "$@"
+    if [[ "${os_id}" == "ubuntu" || "${os_id}" == "debian" ]]; then
+        log "Adding OpenResty repo (${os_id}) …"
+        install_openresty_ubuntu
     else
-        k6 "$@"
-    fi
-}
-
-##############################################################################
-# 1. INSTALL
-##############################################################################
-install_all() {
-    banner "Installing dependencies"
-    local os_id; os_id="$(detect_os_id)"
-
-    # ── OpenResty ────────────────────────────────────────────────────────────
-    if ! command -v openresty &>/dev/null; then
-        if [[ "${os_id}" == "ubuntu" || "${os_id}" == "debian" ]]; then
-            log "Adding OpenResty repo (${os_id}) …"
-            install_openresty_ubuntu
-        else
-            log "Adding OpenResty repo (Amazon Linux family) …"
-            sudo tee /etc/yum.repos.d/openresty.repo >/dev/null <<'REPO'
+        log "Adding OpenResty repo (Amazon Linux family) …"
+        sudo tee /etc/yum.repos.d/openresty.repo >/dev/null <<'REPO'
 [openresty]
 name=Official OpenResty Open Source Repository for Amazon Linux 2023
 baseurl=https://openresty.org/package/amazon/2023/$basearch
@@ -204,47 +284,51 @@ repo_gpgcheck=0
 gpgkey=https://openresty.org/package/pubkey.gpg
 enabled=1
 REPO
-            if ! sudo dnf install -y openresty gettext 2>/dev/null; then
-                warn "AL2023 repo failed — trying AL2 path …"
-                sudo sed -i 's|/2023/|/2/|g' /etc/yum.repos.d/openresty.repo
-                sudo dnf install -y openresty gettext
-            fi
+        if ! sudo dnf install -y openresty gettext 2>/dev/null; then
+            warn "AL2023 repo failed — trying AL2 path …"
+            sudo sed -i 's|/2023/|/2/|g' /etc/yum.repos.d/openresty.repo
+            sudo dnf install -y openresty gettext
         fi
-        ok "OpenResty $(openresty -v 2>&1 | grep -oP 'nginx/[\d.]+')"
-    else
-        ok "OpenResty already present"
     fi
+    ok "OpenResty $(openresty -v 2>&1 | grep -oE 'nginx/[0-9.]+' || true)"
+}
 
-    # ── k6 ───────────────────────────────────────────────────────────────────
-    if ! command -v k6 &>/dev/null; then
-        log "Installing k6 ${K6_VER} …"
-        curl -fsSL \
-            "https://github.com/grafana/k6/releases/download/${K6_VER}/k6-${K6_VER}-linux-amd64.tar.gz" \
-            | sudo tar xz -C /usr/local/bin --strip-components=1 \
-                "k6-${K6_VER}-linux-amd64/k6"
-        ok "k6 $(k6 version | head -1)"
-    else
+ensure_k6() {
+    if command -v k6 &>/dev/null; then
         ok "k6 already present"
+        return 0
     fi
 
-    # ── jq, bc, git ──────────────────────────────────────────────────────────
-    local need=()
-    command -v jq  &>/dev/null || need+=(jq)
-    command -v bc  &>/dev/null || need+=(bc)
-    command -v git &>/dev/null || need+=(git)
-    command -v python3 &>/dev/null || need+=(python3)
-    command -v pip3 &>/dev/null || {
-        if [[ "${os_id}" == "ubuntu" || "${os_id}" == "debian" ]]; then
-            need+=(python3-pip)
-        else
-            need+=(python3-pip)
-        fi
-    }
-    if [[ ${#need[@]} -gt 0 ]]; then
-        pkg_update_index "${os_id}"
-        pkg_install "${os_id}" "${need[@]}"
-    fi
-    ok "jq bc git python3 pip3"
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) die "Unsupported architecture for k6 install: ${arch}" ;;
+    esac
+
+    log "Installing k6 ${K6_VER} …"
+    curl -fsSL \
+        "https://github.com/grafana/k6/releases/download/${K6_VER}/k6-${K6_VER}-linux-${arch}.tar.gz" \
+        | sudo tar xz -C /usr/local/bin --strip-components=1 \
+            "k6-${K6_VER}-linux-${arch}/k6"
+    ok "k6 $(k6 version | head -1)"
+}
+
+install_loadgen_host() {
+    banner "Installing load-generator dependencies"
+    local os_id; os_id="$(detect_os_id)"
+    ensure_common_tools "${os_id}"
+    ensure_k6
+}
+
+install_fairvisor_host() {
+    banner "Installing Fairvisor host dependencies"
+    local os_id; os_id="$(detect_os_id)"
+    ensure_common_tools "${os_id}"
+    ensure_openresty "${os_id}"
+    setup_fairvisor
+    create_policies
 }
 
 ##############################################################################
@@ -261,7 +345,6 @@ setup_fairvisor() {
         sudo git clone --depth=1 https://github.com/fairvisor/edge "${FV_DIR}"
     fi
 
-    # Data-generation scripts (ASN map + Tor geo) — try known candidate names
     for script in \
         "${FV_DIR}/bin/gen_asn_map.py" \
         "${FV_DIR}/data/generate_asn.py" \
@@ -276,37 +359,28 @@ setup_fairvisor() {
         [[ -f "${script}" ]] && { log "Running $(basename "${script}") …"; sudo python3 "${script}" >/dev/null && break; }
     done || true
 
-    # Python runtime deps (tiktoken, etc.)
     [[ -f "${FV_DIR}/requirements.txt" ]] \
         && sudo pip3 install -q -r "${FV_DIR}/requirements.txt" \
         || true
 
-    # Generate / stub out the data files fairvisor's nginx.conf.template needs.
-    # In Docker these are built into the image; here we replicate the layout.
-
-    # Run generation scripts if they exist
     for script in \
         "${FV_DIR}/bin/gen_asn_map.py"  "${FV_DIR}/data/generate_asn.py" \
         "${FV_DIR}/bin/gen_tor_geo.py"  "${FV_DIR}/data/generate_tor.py"; do
         [[ -f "${script}" ]] && sudo python3 "${script}" 2>/dev/null || true
     done
 
-    # Pre-create known required system directories
     sudo mkdir -p /etc/fairvisor /etc/nginx/iplists
 
-    # Copy the ASN type map from the repo (it ships as a static data file)
     local asn_src
     for asn_src in \
         "${FV_DIR}/asn_type.map" \
         "${FV_DIR}/data/asn_type.map"; do
         [[ -f "${asn_src}" ]] && { sudo cp "${asn_src}" /etc/fairvisor/asn_type.map; break; }
     done
-    # Create empty stubs so nginx -t can pass even without real geo data
-    [[ ! -f /etc/fairvisor/asn_type.map    ]] && sudo touch /etc/fairvisor/asn_type.map
+    [[ ! -f /etc/fairvisor/asn_type.map ]] && sudo touch /etc/fairvisor/asn_type.map
     [[ ! -f /etc/nginx/iplists/tor_exits.geo ]] && sudo touch /etc/nginx/iplists/tor_exits.geo
 
     warn "Tor/ASN stubs created (geo lookups disabled for benchmarking)"
-
     ok "Fairvisor ready at ${FV_DIR}"
 }
 
@@ -318,10 +392,10 @@ JWT_SECRET="bench-hs256-key-NOT-for-production"
 gen_jwt() {
     local h; h=$(printf '{"alg":"HS256","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
     local p; p=$(printf '{"sub":"bench-user","org_id":"bench-org","iat":1700000000,"exp":9999999999}' \
-                 | base64 -w0 | tr '+/' '-_' | tr -d '=')
+        | base64 -w0 | tr '+/' '-_' | tr -d '=')
     local sig; sig=$(printf '%s' "${h}.${p}" \
-                 | openssl dgst -sha256 -hmac "${JWT_SECRET}" -binary \
-                 | base64 -w0 | tr '+/' '-_' | tr -d '=')
+        | openssl dgst -sha256 -hmac "${JWT_SECRET}" -binary \
+        | base64 -w0 | tr '+/' '-_' | tr -d '=')
     printf '%s.%s.%s' "${h}" "${p}" "${sig}"
 }
 
@@ -329,7 +403,6 @@ create_policies() {
     local pd="${BENCH_DIR}/policies"
     mkdir -p "${pd}"
 
-    # ── simple: 1 rule, ip:address token_bucket, sky-high cap ────────────────
     cat > "${pd}/simple.json" <<'EOF'
 {
   "bundle_version": 1,
@@ -352,7 +425,6 @@ create_policies() {
 }
 EOF
 
-    # ── complex: 5 rules — ip rate, org quota, user rate, loop detect, circuit ─
     cat > "${pd}/complex.json" <<EOF
 {
   "bundle_version": 1,
@@ -385,7 +457,7 @@ EOF
         },
         {
           "name": "loop-detect",
-          "algorithm": "loop_detection",
+          "algorithm": "loop_detector",
           "algorithm_config": {
             "enabled": true,
             "window_seconds": 60,
@@ -407,7 +479,6 @@ EOF
 }
 EOF
 
-    # ── llm: token_bucket_llm with tiktoken estimation ─────────────────────────
     cat > "${pd}/llm.json" <<EOF
 {
   "bundle_version": 1,
@@ -425,9 +496,9 @@ EOF
         "algorithm": "token_bucket_llm",
         "algorithm_config": {
           "algorithm": "token_bucket_llm",
-          "tokens_per_minute":  99999999999,
-          "tokens_per_day":     99999999999999,
-          "burst_tokens":       99999999999,
+          "tokens_per_minute": 99999999999,
+          "tokens_per_day": 99999999999999,
+          "burst_tokens": 99999999999,
           "default_max_completion": 1024,
           "token_source": { "estimator": "simple_word" },
           "_tpm_bucket_config": {
@@ -448,7 +519,22 @@ EOF
 ##############################################################################
 # 4. SERVICE MANAGEMENT
 ##############################################################################
-declare -a _BGPIDS=()
+run_oresty_bg() {
+    if [[ -n "${TASKSET_BIN}" && -n "${ORESTY_CPUSET}" ]]; then
+        taskset -c "${ORESTY_CPUSET}" "${ORESTY}" "$@" &
+    else
+        "${ORESTY}" "$@" &
+    fi
+    _BGPIDS+=($!)
+}
+
+k6_run() {
+    if [[ -n "${TASKSET_BIN}" && -n "${K6_CPUSET}" ]]; then
+        taskset -c "${K6_CPUSET}" k6 "$@"
+    else
+        k6 "$@"
+    fi
+}
 
 _cleanup() {
     for pid in "${_BGPIDS[@]:-}"; do
@@ -458,7 +544,6 @@ _cleanup() {
 }
 trap '_cleanup' EXIT INT TERM
 
-# Wait until a TCP port is accepting connections, then check /livez
 _wait_port() {
     local port="$1"
     local n=80
@@ -467,10 +552,9 @@ _wait_port() {
         (( n-- ))
         [[ $n -le 0 ]] && return 1
     done
-    # Port open — give HTTP stack a moment, then confirm
     sleep 0.2
     curl -sf "http://127.0.0.1:${port}/livez" >/dev/null 2>&1 || \
-    curl -sf "http://127.0.0.1:${port}/"      >/dev/null 2>&1 || true
+    curl -sf "http://127.0.0.1:${port}/" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -479,7 +563,6 @@ stop_all() {
     sleep 1
 }
 
-# ── Raw nginx baseline ────────────────────────────────────────────────────────
 start_baseline() {
     local pfx="${BENCH_DIR}/run/baseline"
     mkdir -p "${pfx}/logs" "${pfx}/tmp" "${pfx}/conf"
@@ -508,7 +591,6 @@ EOF
     ok "Baseline nginx  :${NGINX_PORT}"
 }
 
-# ── Backend (upstream for reverse-proxy mode) ─────────────────────────────────
 start_backend() {
     local pfx="${BENCH_DIR}/run/backend"
     mkdir -p "${pfx}/logs" "${pfx}/tmp" "${pfx}/conf"
@@ -525,7 +607,6 @@ http {
     listen ${BACKEND_PORT};
     location /livez { return 200 'ok\n'; add_header Content-Type text/plain; }
     location / {
-      # Minimal OpenAI-like response for LLM token estimation tests
       return 200 '{"id":"chatcmpl-bench","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n';
       add_header Content-Type application/json;
     }
@@ -541,14 +622,12 @@ EOF
     ok "Backend nginx    :${BACKEND_PORT}"
 }
 
-# ── Fairvisor ─────────────────────────────────────────────────────────────────
 start_fairvisor() {
-    local mode="$1"   # decision_service | reverse_proxy
-    local policy="$2" # absolute path to policy JSON
+    local mode="$1"
+    local policy="$2"
     local pfx="${BENCH_DIR}/run/fv"
     mkdir -p "${pfx}/logs" "${pfx}/tmp" "${pfx}/conf"
 
-    # Exactly the same vars the entrypoint.sh exports
     export FAIRVISOR_MODE="${mode}"
     export FAIRVISOR_CONFIG_FILE="${policy}"
     export FAIRVISOR_BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}"
@@ -556,23 +635,19 @@ start_fairvisor() {
     export FAIRVISOR_LOG_LEVEL="warn"
     export FAIRVISOR_WORKER_PROCESSES="auto"
 
-    # envsubst using the exact var list from entrypoint.sh
     envsubst \
         '${FAIRVISOR_SHARED_DICT_SIZE} ${FAIRVISOR_LOG_LEVEL} ${FAIRVISOR_MODE} ${FAIRVISOR_BACKEND_URL} ${FAIRVISOR_WORKER_PROCESSES}' \
         < "${FV_DIR}/docker/nginx.conf.template" \
         > "${pfx}/conf/nginx.conf"
 
-    # Fix paths for non-Docker layout
     sed -i \
         -e "s|/usr/local/openresty/nginx/logs/|${pfx}/logs/|g" \
-        -e "s|/usr/local/openresty/nginx/tmp/|${pfx}/tmp/|g"   \
-        -e "s|pid /tmp/nginx\.pid|pid ${pfx}/tmp/nginx.pid|g"  \
-        -e "s|listen 8080 |listen ${FV_PORT} |g"               \
-        -e "s|listen 8080;|listen ${FV_PORT};|g"               \
+        -e "s|/usr/local/openresty/nginx/tmp/|${pfx}/tmp/|g" \
+        -e "s|pid /tmp/nginx\.pid|pid ${pfx}/tmp/nginx.pid|g" \
+        -e "s|listen 8080 |listen ${FV_PORT} |g" \
+        -e "s|listen 8080;|listen ${FV_PORT};|g" \
         "${pfx}/conf/nginx.conf"
 
-    # Auto-stub any missing include files so nginx -t passes.
-    # Fairvisor's template may reference geo/map files that only exist in Docker.
     local _attempt
     for _attempt in 1 2 3; do
         local _test_err
@@ -580,8 +655,6 @@ start_fairvisor() {
         if echo "${_test_err}" | grep -q 'test is successful\|configuration file.*test is successful'; then
             break
         fi
-        # Extract the missing file path from emerg messages like:
-        #   open() "/some/path/file" failed (2: No such file or directory)
         local _missing
         _missing=$(echo "${_test_err}" | grep -oP 'open\(\) "\K[^"]+(?=" failed \(2)' | head -1)
         if [[ -n "${_missing}" ]]; then
@@ -589,7 +662,6 @@ start_fairvisor() {
             sudo mkdir -p "$(dirname "${_missing}")"
             sudo touch "${_missing}"
         else
-            # Some other error — cannot auto-fix
             warn "nginx -t failed:"
             echo "${_test_err}" >&2
             die "Aborting — unrecoverable nginx config error."
@@ -606,23 +678,6 @@ start_fairvisor() {
         die "Aborting."
     }
     ok "Fairvisor [${mode}]  :${FV_PORT}  policy=$(basename "${policy}")"
-
-    # Quick sanity check — show exactly what /v1/decision returns
-    local _sc _body
-    _body=$(curl -si -X POST \
-        -H "Content-Type: application/json" \
-        -H "X-Forwarded-For: 203.0.113.1" \
-        -H "X-Original-Method: POST" \
-        -H "X-Original-URI: /v1/chat/completions" \
-        --data '{}' \
-        "http://127.0.0.1:${FV_PORT}/v1/decision" 2>/dev/null | head -5) || true
-    _sc=$(echo "${_body}" | grep -oP 'HTTP/\S+\s+\K\d+' | head -1)
-    log "  /v1/decision sanity: HTTP ${_sc:-???}"
-    [[ -n "${_body}" ]] && echo "${_body}" | head -3 || true
-    # Also show error.log if it has content
-    [[ -s "${pfx}/logs/error.log" ]] && {
-        log "  error.log:"; tail -5 "${pfx}/logs/error.log"
-    } || true
 }
 
 ##############################################################################
@@ -630,10 +685,8 @@ start_fairvisor() {
 ##############################################################################
 _k6_dir() { mkdir -p "${BENCH_DIR}/scripts"; echo "${BENCH_DIR}/scripts"; }
 
-# Latency script: constant-arrival-rate at LATENCY_RPS for LATENCY_DUR seconds
 write_latency_js() {
     local name="$1" url="$2" rps="$3" dur="$4" jwt="$5" mode="$6"
-    # mode: "get" | "decision" | "post"
     local f; f="$(_k6_dir)/${name}.js"
     cat > "${f}" <<EOF
 import http from 'k6/http';
@@ -643,29 +696,29 @@ import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.2/index.js';
 export const options = {
   scenarios: {
     steady: {
-      executor:        'constant-arrival-rate',
-      rate:            ${rps},
-      timeUnit:        '1s',
-      duration:        '${dur}s',
+      executor: 'constant-arrival-rate',
+      rate: ${rps},
+      timeUnit: '1s',
+      duration: '${dur}s',
       preAllocatedVUs: 200,
-      maxVUs:          500,
+      maxVUs: 500,
     },
   },
-  summaryTrendStats:  ['p(50)','p(90)','p(99)','p(99.9)','max'],
+  summaryTrendStats: ['p(50)','p(90)','p(99)','p(99.9)','max'],
 };
 
-const URL  = '${url}';
-const JWT  = '${jwt}';
+const URL = '${url}';
+const JWT = '${jwt}';
 const MODE = '${mode}';
 
 export default function () {
   const headers = { 'Content-Type': 'application/json' };
-  if (JWT)             headers['Authorization'] = 'Bearer ' + JWT;
+  if (JWT) headers['Authorization'] = 'Bearer ' + JWT;
   let res;
   if (MODE === 'decision') {
-    headers['X-Forwarded-For']   = \`203.0.113.\${(__VU % 254) + 1}\`;
+    headers['X-Forwarded-For'] = \`203.0.113.\${(__VU % 254) + 1}\`;
     headers['X-Original-Method'] = 'POST';
-    headers['X-Original-URI']    = '/v1/chat/completions';
+    headers['X-Original-URI'] = '/v1/chat/completions';
     res = http.post(URL, '{}', { headers });
   } else {
     res = http.get(URL, { headers });
@@ -673,11 +726,10 @@ export default function () {
   check(res, { '2xx/204': r => (r.status >= 200 && r.status < 300) || r.status === 204 });
 }
 
-// handleSummary is reliable in all k6 versions (unlike --summary-export)
 export function handleSummary(data) {
   const outFile = __ENV.SUMMARY_OUT || '/tmp/k6_last_summary.json';
   return {
-    stdout:   textSummary(data, { indent: ' ', enableColors: true }),
+    stdout: textSummary(data, { indent: ' ', enableColors: true }),
     [outFile]: JSON.stringify(data),
   };
 }
@@ -685,7 +737,6 @@ EOF
     echo "${f}"
 }
 
-# Warmup script: fixed VUs, no scenario
 write_warmup_js() {
     local name="$1" url="$2" jwt="$3"
     local f; f="$(_k6_dir)/${name}_warmup.js"
@@ -701,7 +752,6 @@ EOF
     echo "${f}"
 }
 
-# Throughput step script: constant-arrival-rate at a specific RPS for 20s
 write_step_js() {
     local name="$1" url="$2" rps="$3" jwt="$4" body="$5"
     local f; f="$(_k6_dir)/${name}.js"
@@ -712,25 +762,24 @@ import { check } from 'k6';
 export const options = {
   scenarios: {
     step: {
-      executor:        'constant-arrival-rate',
-      rate:            ${rps},
-      timeUnit:        '1s',
-      duration:        '20s',
+      executor: 'constant-arrival-rate',
+      rate: ${rps},
+      timeUnit: '1s',
+      duration: '20s',
       preAllocatedVUs: 600,
-      maxVUs:          2500,
+      maxVUs: 2500,
     },
   },
   summaryTrendStats: ['p(50)','p(99)'],
 };
 
-const URL  = '${url}';
-const JWT  = '${jwt}';
+const URL = '${url}';
+const JWT = '${jwt}';
 const BODY = \`${body}\`;
 
 export default function () {
   const headers = { 'Content-Type': 'application/json' };
-  if (JWT)  headers['Authorization'] = 'Bearer ' + JWT;
-  // Vary per-VU so loop_detection doesn't fire
+  if (JWT) headers['Authorization'] = 'Bearer ' + JWT;
   headers['X-Request-Id'] = \`\${__VU}-\${__ITER}\`;
   const res = BODY
     ? http.post(URL, BODY, { headers })
@@ -747,96 +796,182 @@ EOF
 }
 
 ##############################################################################
-# 6. RUN BENCHMARKS
+# 6. LOCAL RESULT PARSING
 ##############################################################################
 _parse_latency() {
-    # Read k6 handleSummary JSON (ms values), convert ms→μs, store into named assoc array
-    # dst = "LAT_D" | "LAT_P" | "LAT_N"
     local file="$1" dst="$2"
-
     if [[ ! -s "${file}" ]]; then
         warn "_parse_latency: ${file} is empty or missing — skipping"
         return 0
     fi
 
-    # Prefer http_req_duration; fall back to http_req_waiting (TTFB)
-    # k6 v0.54 handleSummary keys: "p(50)", "p(90)", "p(99)", "p(99.9)"
     local p50 p90 p99 p999
-    p50=$(  jq -r '
-      (.metrics.http_req_duration.values  // .metrics.http_req_waiting.values) |
-      (.["p(50)"] // .med // 0)
-    ' "${file}")
-    p90=$(  jq -r '
-      (.metrics.http_req_duration.values  // .metrics.http_req_waiting.values) |
-      (.["p(90)"] // 0)
-    ' "${file}")
-    p99=$(  jq -r '
-      (.metrics.http_req_duration.values  // .metrics.http_req_waiting.values) |
-      (.["p(99)"] // 0)
-    ' "${file}")
-    p999=$( jq -r '
-      (.metrics.http_req_duration.values  // .metrics.http_req_waiting.values) |
-      (.["p(99.9)"] // 0)
-    ' "${file}")
+    p50=$(jq -r '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(50)"] // .med // 0)' "${file}")
+    p90=$(jq -r '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(90)"] // 0)' "${file}")
+    p99=$(jq -r '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(99)"] // 0)' "${file}")
+    p999=$(jq -r '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(99.9)"] // 0)' "${file}")
 
-    eval "${dst}[p50]=$(  printf '%.0f' "$(echo "${p50}  * 1000" | bc -l)")"
-    eval "${dst}[p90]=$(  printf '%.0f' "$(echo "${p90}  * 1000" | bc -l)")"
-    eval "${dst}[p99]=$(  printf '%.0f' "$(echo "${p99}  * 1000" | bc -l)")"
-    eval "${dst}[p999]=$( printf '%.0f' "$(echo "${p999} * 1000" | bc -l)")"
+    eval "${dst}[p50]=$(printf '%.0f' "$(echo "${p50} * 1000" | bc -l)")"
+    eval "${dst}[p90]=$(printf '%.0f' "$(echo "${p90} * 1000" | bc -l)")"
+    eval "${dst}[p99]=$(printf '%.0f' "$(echo "${p99} * 1000" | bc -l)")"
+    eval "${dst}[p999]=$(printf '%.0f' "$(echo "${p999} * 1000" | bc -l)")"
 }
 
-run_latency_test() {
-    local label="$1" script="$2" warmup="$3" dst="$4"
-    local out="${BENCH_DIR}/results/lat_${label}.json"
-    mkdir -p "${BENCH_DIR}/results"
+parse_throughput_result() {
+    local label="$1" file="$2"
+    if [[ ! -s "${file}" ]]; then
+        warn "throughput summary missing: ${file}"
+        THR_RES["${label}"]=0
+        return 0
+    fi
+
+    local err_rate p99_ms rps
+    err_rate=$(jq '.metrics.http_req_failed.values.rate // 1' "${file}" 2>/dev/null || echo 1)
+    p99_ms=$(jq '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(99)"] // 9999)' "${file}" 2>/dev/null || echo 9999)
+    rps=$(jq '.metrics.http_reqs.values.rate // 0' "${file}" 2>/dev/null || echo 0)
+
+    local pass_err pass_p99
+    pass_err=$(echo "${err_rate} < 0.01" | bc -l)
+    pass_p99=$(echo "${p99_ms} < 1000" | bc -l)
+
+    if [[ "${pass_err}" == "1" && "${pass_p99}" == "1" ]]; then
+        THR_RES["${label}"]=$(printf '%.0f' "${rps}")
+    else
+        THR_RES["${label}"]=0
+    fi
+}
+
+##############################################################################
+# 7. REMOTE HELPER COMMANDS
+##############################################################################
+helper_install() {
+    local role="$1"
+    mkdir -p "${BENCH_DIR}/results" "${BENCH_DIR}/scripts"
+    case "${role}" in
+        fairvisor) install_fairvisor_host ;;
+        loadgen) install_loadgen_host ;;
+        *) die "Unknown helper-install role: ${role}" ;;
+    esac
+}
+
+helper_start() {
+    local what="$1"
+    mkdir -p "${BENCH_DIR}/results" "${BENCH_DIR}/scripts"
+    case "${what}" in
+        baseline)
+            pkill -f "openresty" 2>/dev/null || true
+            sleep 1
+            start_baseline
+            ;;
+        backend)
+            pkill -f "openresty" 2>/dev/null || true
+            sleep 1
+            start_backend
+            ;;
+        *)
+            die "Unknown helper-start target: ${what}"
+            ;;
+    esac
+}
+
+helper_start_fairvisor() {
+    local mode="$1" policy_name="$2"
+    pkill -f "openresty" 2>/dev/null || true
+    sleep 1
+    if [[ "${mode}" == "reverse_proxy" ]]; then
+        start_backend
+    fi
+    start_fairvisor "${mode}" "${BENCH_DIR}/policies/${policy_name}"
+}
+
+helper_stop_all() {
+    stop_all
+    pkill -f "openresty" 2>/dev/null || true
+}
+
+helper_run_latency() {
+    local label="$1" url="$2" jwt="$3" mode="$4"
+    mkdir -p "${BENCH_DIR}/results" "${BENCH_DIR}/scripts"
+    local script warmup out
+    script=$(write_latency_js "lat_${label}" "${url}" "${LATENCY_RPS}" "${LATENCY_DUR}" "${jwt}" "${mode}")
+    warmup=$(write_warmup_js "lat_${label}" "${url}" "${jwt}")
+    out="${BENCH_DIR}/results/lat_${label}.json"
 
     log "Warmup ${label} (${WARMUP_DUR}s) …"
     k6_run run --quiet --no-summary "${warmup}" >/dev/null 2>&1 || true
 
-    log "Latency test: ${label}  @ ${LATENCY_RPS} RPS for ${LATENCY_DUR}s …"
-    # SUMMARY_OUT passed via -e so handleSummary writes the JSON reliably
-    # || true: threshold failures (k6 exit 99) must not abort the suite
+    log "Latency test: ${label} @ ${LATENCY_RPS} RPS for ${LATENCY_DUR}s …"
     k6_run run -e "SUMMARY_OUT=${out}" "${script}" 2>&1 | tail -18 || true
-
-    _parse_latency "${out}" "${dst}"
-    eval "ok \"${label}: p50=\${${dst}[p50]}μs  p90=\${${dst}[p90]}μs  p99=\${${dst}[p99]}μs  p99.9=\${${dst}[p999]}μs\""
 }
 
-# Stepping throughput: try increasing RPS until >1% errors or p99 > 1 s
-run_throughput_test() {
+helper_run_throughput() {
     local label="$1" url="$2" jwt="$3" body="$4" target="$5"
-    local best=0
-
-    log "Throughput stepping test: ${label}  (target=${target} RPS) …"
+    mkdir -p "${BENCH_DIR}/results" "${BENCH_DIR}/scripts"
 
     for pct in 50 70 90 100 115 130; do
-        local rps=$(( target * pct / 100 ))
-        local step_name="thr_${label}_${pct}"
-        local step_out="${BENCH_DIR}/results/${step_name}.json"
-
-        local js; js=$(write_step_js "${step_name}" "${url}" "${rps}" "${jwt}" "${body}")
-
-        log "  → step ${pct}%  (${rps} RPS, 20s) …"
+        local rps step_name step_out js
+        rps=$(( target * pct / 100 ))
+        step_name="thr_${label}_${pct}"
+        step_out="${BENCH_DIR}/results/${step_name}.json"
+        js=$(write_step_js "${step_name}" "${url}" "${rps}" "${jwt}" "${body}")
+        log "  → step ${pct}% (${rps} RPS, 20s) …"
         k6_run run --quiet -e "SUMMARY_OUT=${step_out}" "${js}" >/dev/null 2>&1 || true
+    done
+}
+
+##############################################################################
+# 8. CONTROLLER FLOW
+##############################################################################
+controller_prepare() {
+    require_remote_config
+    mkdir -p "${BENCH_DIR}/controller-results"
+
+    log "Syncing orchestration script to remote hosts"
+    sync_script_to_remote "${FAIRVISOR_REMOTE}"
+    sync_script_to_remote "${LOADGEN_REMOTE}"
+
+    banner "Preparing remote Fairvisor host"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-install fairvisor
+
+    banner "Preparing remote load-generator host"
+    remote_helper "${LOADGEN_REMOTE}" helper-install loadgen
+}
+
+controller_fetch_latency() {
+    local label="$1" dst="$2"
+    local local_file="${BENCH_DIR}/controller-results/lat_${label}.json"
+    fetch_remote_file "${LOADGEN_REMOTE}" "${BENCH_DIR}/results/lat_${label}.json" "${local_file}"
+    _parse_latency "${local_file}" "${dst}"
+}
+
+controller_fetch_best_throughput() {
+    local label="$1" target="$2"
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        warn "Skipping throughput result parsing in DRY_RUN for ${label}"
+        THR_RES["${label}"]="N/A"
+        return 0
+    fi
+    local best=0
+    local pct
+
+    for pct in 50 70 90 100 115 130; do
+        local local_file="${BENCH_DIR}/controller-results/thr_${label}_${pct}.json"
+        fetch_remote_file "${LOADGEN_REMOTE}" "${BENCH_DIR}/results/thr_${label}_${pct}.json" "${local_file}"
 
         local err_rate p99_ms
-        err_rate=$( jq '
-          .metrics.http_req_failed.values.rate // 1
-        ' "${step_out}" 2>/dev/null || echo 1)
-        p99_ms=$(   jq '
-          (.metrics.http_req_duration.values  // .metrics.http_req_waiting.values) |
-          (.["p(99)"] // 9999)
-        ' "${step_out}" 2>/dev/null || echo 9999)
+        err_rate=$(jq '.metrics.http_req_failed.values.rate // 1' "${local_file}" 2>/dev/null || echo 1)
+        p99_ms=$(jq '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(99)"] // 9999)' "${local_file}" 2>/dev/null || echo 9999)
 
-        local pass_err pass_p99
-        pass_err=$(echo "${err_rate} < 0.01"   | bc -l)
-        pass_p99=$(echo "${p99_ms}  < 1000"    | bc -l)   # p99 < 1 s
+        local pass_err pass_p99 current
+        pass_err=$(echo "${err_rate} < 0.01" | bc -l)
+        pass_p99=$(echo "${p99_ms} < 1000" | bc -l)
+        current=$(( target * pct / 100 ))
 
         if [[ "${pass_err}" == "1" && "${pass_p99}" == "1" ]]; then
-            best="${rps}"
-            ok "    PASS @ ${rps} RPS  (err=$(printf '%.2f%%' "$(echo "${err_rate}*100" | bc -l)")  p99=$(printf '%.0fms' "${p99_ms}"))"
+            best="${current}"
+            ok "    PASS @ ${current} RPS  (err=$(printf '%.2f%%' "$(echo "${err_rate}*100" | bc -l)")  p99=$(printf '%.0fms' "${p99_ms}"))"
         else
-            warn "    FAIL @ ${rps} RPS  (err=$(printf '%.2f%%' "$(echo "${err_rate}*100" | bc -l)")  p99=$(printf '%.0fms' "${p99_ms}")) — stopping"
+            warn "    FAIL @ ${current} RPS  (err=$(printf '%.2f%%' "$(echo "${err_rate}*100" | bc -l)")  p99=$(printf '%.0fms' "${p99_ms}")) — stopping"
             break
         fi
     done
@@ -845,8 +980,168 @@ run_throughput_test() {
     ok "${label}: max sustained ≈ ${best} RPS"
 }
 
+controller_benchmark() {
+    local jwt pd fv_url nginx_url decision_url llm_body
+    jwt="$(gen_jwt)"
+    pd="${BENCH_DIR}/policies"
+    fv_url="http://${FAIRVISOR_TARGET_HOST}:${FV_PORT}"
+    nginx_url="http://${FAIRVISOR_TARGET_HOST}:${NGINX_PORT}"
+    decision_url="${fv_url}/v1/decision"
+    llm_body='{"model":"gpt-4o","messages":[{"role":"user","content":"Hello, this is a benchmark test message for token estimation."}]}'
+
+    banner "TEST 1/6 — Raw nginx baseline (latency)"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+    remote_helper "${FAIRVISOR_REMOTE}" helper-start baseline
+    remote_helper "${LOADGEN_REMOTE}" helper-run-latency nginx "${nginx_url}/" "" get
+    controller_fetch_latency "nginx" "LAT_N"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+
+    banner "TEST 2/6 — Fairvisor decision_service (latency)"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+    remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor decision_service simple.json
+    remote_helper "${LOADGEN_REMOTE}" helper-run-latency decision "${decision_url}" "${jwt}" decision
+    controller_fetch_latency "decision" "LAT_D"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+
+    banner "TEST 3/6 — Fairvisor reverse_proxy (latency)"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+    remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy simple.json
+    remote_helper "${LOADGEN_REMOTE}" helper-run-latency proxy "${fv_url}/" "${jwt}" get
+    controller_fetch_latency "proxy" "LAT_P"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+
+    banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+    remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy simple.json
+    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput simple "${fv_url}/" "" "" "${TGT_T[simple]}"
+    controller_fetch_best_throughput "simple" "${TGT_T[simple]}"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+
+    banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+    remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy complex.json
+    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput complex "${fv_url}/" "${jwt}" "" "${TGT_T[complex]}"
+    controller_fetch_best_throughput "complex" "${TGT_T[complex]}"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+
+    banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+    remote_helper "${FAIRVISOR_REMOTE}" helper-start-fairvisor reverse_proxy llm.json
+    remote_helper "${LOADGEN_REMOTE}" helper-run-throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${TGT_T[llm]}"
+    controller_fetch_best_throughput "llm" "${TGT_T[llm]}"
+    remote_helper "${FAIRVISOR_REMOTE}" helper-stop-all
+}
+
+controller_main() {
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        require_remote_config
+        controller_prepare
+        controller_benchmark || true
+        ok "Dry-run completed for remote controller flow"
+        return 0
+    fi
+
+    controller_prepare
+    controller_benchmark
+    print_results "controller"
+}
+
 ##############################################################################
-# 7. RESULTS TABLE
+# 9. LOCAL SINGLE-HOST FLOW
+##############################################################################
+local_single_host_main() {
+    mkdir -p "${BENCH_DIR}/results" "${BENCH_DIR}/scripts"
+
+    if [[ -n "${TASKSET_BIN}" ]]; then
+        log "CPU pinning: openresty='${ORESTY_CPUSET:-auto/off}'  k6='${K6_CPUSET:-auto/off}'"
+    else
+        warn "taskset not found — CPU pinning disabled"
+    fi
+
+    pkill -f "openresty" 2>/dev/null || true
+    sleep 1
+
+    install_loadgen_host
+    local os_id; os_id="$(detect_os_id)"
+    ensure_openresty "${os_id}"
+    setup_fairvisor
+    create_policies
+
+    local jwt pd fv_url nginx_url decision_url llm_body s_lat s_warmup
+    jwt="$(gen_jwt)"
+    pd="${BENCH_DIR}/policies"
+    fv_url="http://127.0.0.1:${FV_PORT}"
+    nginx_url="http://127.0.0.1:${NGINX_PORT}"
+    decision_url="${fv_url}/v1/decision"
+    llm_body='{"model":"gpt-4o","messages":[{"role":"user","content":"Hello, this is a benchmark test message for token estimation."}]}'
+
+    banner "TEST 1/6 — Raw nginx baseline (latency)"
+    start_baseline
+    s_lat=$(write_latency_js "lat_nginx" "${nginx_url}/" "${LATENCY_RPS}" "${LATENCY_DUR}" "" get)
+    s_warmup=$(write_warmup_js "lat_nginx" "${nginx_url}/" "")
+    helper_run_latency nginx "${nginx_url}/" "" get >/dev/null 2>&1 || true
+    _parse_latency "${BENCH_DIR}/results/lat_nginx.json" "LAT_N"
+    stop_all
+
+    banner "TEST 2/6 — Fairvisor decision_service (latency)"
+    start_fairvisor decision_service "${pd}/simple.json"
+    helper_run_latency decision "${decision_url}" "${jwt}" decision >/dev/null 2>&1 || true
+    _parse_latency "${BENCH_DIR}/results/lat_decision.json" "LAT_D"
+    stop_all
+
+    banner "TEST 3/6 — Fairvisor reverse_proxy (latency)"
+    start_backend
+    start_fairvisor reverse_proxy "${pd}/simple.json"
+    helper_run_latency proxy "${fv_url}/" "${jwt}" get >/dev/null 2>&1 || true
+    _parse_latency "${BENCH_DIR}/results/lat_proxy.json" "LAT_P"
+    stop_all
+
+    banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
+    start_backend
+    start_fairvisor reverse_proxy "${pd}/simple.json"
+    helper_run_throughput simple "${fv_url}/" "" "" "${TGT_T[simple]}"
+    controller_fetch_best_throughput_local simple "${TGT_T[simple]}"
+    stop_all
+
+    banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
+    start_backend
+    start_fairvisor reverse_proxy "${pd}/complex.json"
+    helper_run_throughput complex "${fv_url}/" "${jwt}" "" "${TGT_T[complex]}"
+    controller_fetch_best_throughput_local complex "${TGT_T[complex]}"
+    stop_all
+
+    banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
+    start_backend
+    start_fairvisor reverse_proxy "${pd}/llm.json"
+    helper_run_throughput llm "${fv_url}/" "${jwt}" "${llm_body}" "${TGT_T[llm]}"
+    controller_fetch_best_throughput_local llm "${TGT_T[llm]}"
+    stop_all
+
+    print_results "single-host"
+}
+
+controller_fetch_best_throughput_local() {
+    local label="$1" target="$2"
+    local best=0 pct
+
+    for pct in 50 70 90 100 115 130; do
+        local file="${BENCH_DIR}/results/thr_${label}_${pct}.json"
+        local err_rate p99_ms current
+        err_rate=$(jq '.metrics.http_req_failed.values.rate // 1' "${file}" 2>/dev/null || echo 1)
+        p99_ms=$(jq '(.metrics.http_req_duration.values // .metrics.http_req_waiting.values) | (.["p(99)"] // 9999)' "${file}" 2>/dev/null || echo 9999)
+        current=$(( target * pct / 100 ))
+        if [[ "$(echo "${err_rate} < 0.01" | bc -l)" == "1" && "$(echo "${p99_ms} < 1000" | bc -l)" == "1" ]]; then
+            best="${current}"
+        else
+            break
+        fi
+    done
+    THR_RES["${label}"]="${best}"
+    ok "${label}: max sustained ≈ ${best} RPS"
+}
+
+##############################################################################
+# 10. RESULTS TABLE
 ##############################################################################
 _us() {
     local v="$1"
@@ -860,8 +1155,9 @@ _us() {
 _col_lat() {
     local got="$1" tgt="$2"
     [[ "${got}" == "N/A" ]] && echo "${YLW}" && return
-    local ok110;  ok110=$(  printf '%.0f' "$(echo "${tgt}*1.10" | bc -l)")
-    local ok130;  ok130=$(  printf '%.0f' "$(echo "${tgt}*1.30" | bc -l)")
+    local ok110 ok130
+    ok110=$(printf '%.0f' "$(echo "${tgt}*1.10" | bc -l)")
+    ok130=$(printf '%.0f' "$(echo "${tgt}*1.30" | bc -l)")
     (( got <= ok110 )) && echo "${GRN}" && return
     (( got <= ok130 )) && echo "${YLW}" && return
     echo "${RED}"
@@ -870,43 +1166,44 @@ _col_lat() {
 _col_thr() {
     local got="$1" tgt="$2"
     [[ "${got}" == "N/A" || "${got}" == "0" ]] && echo "${YLW}" && return
-    local ok90; ok90=$(printf '%.0f' "$(echo "${tgt}*0.90" | bc -l)")
+    local ok90
+    ok90=$(printf '%.0f' "$(echo "${tgt}*0.90" | bc -l)")
     (( got >= ok90 )) && echo "${GRN}" || echo "${RED}"
 }
 
 print_results() {
-    local W=82
-    local hr; hr=$(printf '═%.0s' $(seq 1 $W))
-    local hr2; hr2=$(printf '─%.0s' $(seq 1 $W))
+    local mode_label="${1:-single-host}"
+    local w=82 hr hr2
+    hr=$(printf '═%.0s' $(seq 1 $w))
+    hr2=$(printf '─%.0s' $(seq 1 $w))
 
     echo ""
     echo -e "${BOLD}${hr}${RST}"
-    echo -e "${BOLD}  FAIRVISOR BENCHMARK RESULTS${RST}"
+    echo -e "${BOLD}  FAIRVISOR BENCHMARK RESULTS (${mode_label})${RST}"
     echo -e "${BOLD}${hr}${RST}"
 
-    # ── Latency ──────────────────────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}  Latency @ ${LATENCY_RPS} RPS steady state${RST}  ${DIM}(target: fairvisor/edge README)${RST}"
     echo ""
     printf "  ${BOLD}%-8s  %-26s  %-26s  %-20s${RST}\n" \
         "Pct" "Decision Service" "Reverse Proxy" "Raw nginx"
     printf "  %-8s  %-26s  %-26s  %-20s\n" \
-        "────────" "────────────────────────" "────────────────────────" "──────────────────"
+        "────────" "${hr2:0:24}" "${hr2:0:24}" "${hr2:0:18}"
 
     local rows=("p50:p50:112:241:71" "p90:p90:191:376:190" "p99:p99:426:822:446" "p99.9:p999:2990:2980:1610")
+    local row
     for row in "${rows[@]}"; do
         IFS=: read -r lbl key td tp tn <<< "${row}"
 
-        local gd; eval "gd=\${LAT_D[${key}]:-N/A}"
-        local gp; eval "gp=\${LAT_P[${key}]:-N/A}"
-        local gn; eval "gn=\${LAT_N[${key}]:-N/A}"
+        local gd gp gn fd fp fn cd cp cn
+        eval "gd=\${LAT_D[${key}]:-N/A}"
+        eval "gp=\${LAT_P[${key}]:-N/A}"
+        eval "gn=\${LAT_N[${key}]:-N/A}"
 
-        local fd fp fn
-        [[ "${gd}" == "N/A" ]] && fd="N/A (tgt: $(_us $td))" || fd="$(_us $gd) (tgt: $(_us $td))"
-        [[ "${gp}" == "N/A" ]] && fp="N/A (tgt: $(_us $tp))" || fp="$(_us $gp) (tgt: $(_us $tp))"
-        [[ "${gn}" == "N/A" ]] && fn="N/A (tgt: $(_us $tn))" || fn="$(_us $gn) (tgt: $(_us $tn))"
+        [[ "${gd}" == "N/A" ]] && fd="N/A (tgt: $(_us "$td"))" || fd="$(_us "$gd") (tgt: $(_us "$td"))"
+        [[ "${gp}" == "N/A" ]] && fp="N/A (tgt: $(_us "$tp"))" || fp="$(_us "$gp") (tgt: $(_us "$tp"))"
+        [[ "${gn}" == "N/A" ]] && fn="N/A (tgt: $(_us "$tn"))" || fn="$(_us "$gn") (tgt: $(_us "$tn"))"
 
-        local cd cp cn
         [[ "${gd}" == "N/A" ]] && cd="${YLW}" || cd=$(_col_lat "${gd}" "${td}")
         [[ "${gp}" == "N/A" ]] && cp="${YLW}" || cp=$(_col_lat "${gp}" "${tp}")
         [[ "${gn}" == "N/A" ]] && cn="${YLW}" || cn=$(_col_lat "${gn}" "${tn}")
@@ -915,13 +1212,11 @@ print_results() {
             "${lbl}" "${fd}" "${fp}" "${fn}"
     done
 
-    # ── Throughput ───────────────────────────────────────────────────────────
     echo ""
-    echo -e "${BOLD}  Max Sustained Throughput — single instance${RST}"
+    echo -e "${BOLD}  Max Sustained Throughput — single fairvisor instance${RST}"
     echo ""
     printf "  ${BOLD}%-48s  %-14s  %-14s${RST}\n" "Configuration" "Measured RPS" "Target RPS"
-    printf "  %-48s  %-14s  %-14s\n" \
-        "$(printf '─%.0s' $(seq 1 48))" "──────────────" "──────────────"
+    printf "  %-48s  %-14s  %-14s\n" "${hr2:0:48}" "──────────────" "──────────────"
 
     local thr_rows=(
         "simple:110500:Simple rate limit (1 rule)"
@@ -931,7 +1226,8 @@ print_results() {
     for row in "${thr_rows[@]}"; do
         IFS=: read -r key tgt lbl <<< "${row}"
         local got="${THR_RES[${key}]:-N/A}"
-        local col; col=$(_col_thr "${got}" "${tgt}")
+        local col
+        col=$(_col_thr "${got}" "${tgt}")
         printf "  %-48s  ${col}%-14s${RST}  %-14s\n" "${lbl}" "${got}" "${tgt}"
     done
 
@@ -939,95 +1235,49 @@ print_results() {
     echo -e "  ${DIM}Colour: ${GRN}within 10% of target${RST}${DIM}  ${YLW}within 30% / N/A${RST}${DIM}  ${RED}>30% off${RST}"
     echo -e "${BOLD}${hr}${RST}"
     echo ""
-    echo -e "  Raw k6 summaries → ${BENCH_DIR}/results/"
-    echo -e "  Service logs     → ${BENCH_DIR}/run/*/logs/"
+    echo -e "  Local controller artifacts → ${BENCH_DIR}/controller-results/"
+    echo -e "  Loadgen artifacts          → ${BENCH_DIR}/results/ on ${LOADGEN_REMOTE:-local}"
+    echo -e "  Fairvisor logs             → ${BENCH_DIR}/run/*/logs/ on ${FAIRVISOR_REMOTE:-local}"
     echo ""
 }
 
 ##############################################################################
-# MAIN
+# 11. ENTRYPOINT
 ##############################################################################
+dispatch_helper() {
+    local cmd="$1"
+    shift
+    case "${cmd}" in
+        helper-install) helper_install "$@" ;;
+        helper-start) helper_start "$@" ;;
+        helper-start-fairvisor) helper_start_fairvisor "$@" ;;
+        helper-stop-all) helper_stop_all ;;
+        helper-run-latency) helper_run_latency "$@" ;;
+        helper-run-throughput) helper_run_throughput "$@" ;;
+        *)
+            die "Unknown command: ${cmd}"
+            ;;
+    esac
+}
+
 main() {
     echo -e "${BOLD}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║         FAIRVISOR BENCHMARK SUITE  v1.0                     ║"
-    echo "║  Decision Service · Reverse Proxy · Raw nginx (baseline)    ║"
+    echo "║         FAIRVISOR BENCHMARK SUITE  v2.0                     ║"
+    echo "║  Controller · Fairvisor host · Load generator host          ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${RST}"
 
-    mkdir -p "${BENCH_DIR}/results" "${BENCH_DIR}/scripts"
-
-    if [[ -n "${TASKSET_BIN}" ]]; then
-        log "CPU pinning: openresty='${ORESTY_CPUSET:-auto/off}'  k6='${K6_CPUSET:-auto/off}'"
-    else
-        warn "taskset not found — CPU pinning disabled"
+    if [[ $# -gt 0 && "$1" == helper-* ]]; then
+        dispatch_helper "$@"
+        return 0
     fi
 
-    # Kill any stale OpenResty processes from a previous run
-    pkill -f "openresty" 2>/dev/null || true
-    sleep 1
-
-    install_all
-    setup_fairvisor
-    create_policies
-
-    local JWT; JWT=$(gen_jwt)
-    local PD="${BENCH_DIR}/policies"
-    local FV_URL="http://127.0.0.1:${FV_PORT}"
-    local NGINX_URL="http://127.0.0.1:${NGINX_PORT}"
-    local DECISION_URL="${FV_URL}/v1/decision"
-
-    # LLM request body — realistic short chat message for token estimation
-    local LLM_BODY='{"model":"gpt-4o","messages":[{"role":"user","content":"Hello, this is a benchmark test message for token estimation."}]}'
-
-    # ── TEST 1/6: Raw nginx baseline ──────────────────────────────────────────
-    banner "TEST 1/6 — Raw nginx baseline (latency)"
-    start_baseline
-    s_lat=$(   write_latency_js "lat_nginx" "${NGINX_URL}/" "${LATENCY_RPS}" "${LATENCY_DUR}" "" "get")
-    s_warmup=$(write_warmup_js  "lat_nginx" "${NGINX_URL}/" "")
-    run_latency_test "nginx" "${s_lat}" "${s_warmup}" "LAT_N"
-    stop_all
-
-    # ── TEST 2/6: Decision service latency ───────────────────────────────────
-    banner "TEST 2/6 — Fairvisor decision_service (latency)"
-    start_backend
-    start_fairvisor "decision_service" "${PD}/simple.json"
-    s_lat=$(   write_latency_js "lat_decision" "${DECISION_URL}" "${LATENCY_RPS}" "${LATENCY_DUR}" "${JWT}" "decision")
-    s_warmup=$(write_warmup_js  "lat_decision" "${DECISION_URL}" "${JWT}")
-    run_latency_test "decision" "${s_lat}" "${s_warmup}" "LAT_D"
-    stop_all
-
-    # ── TEST 3/6: Reverse proxy latency ──────────────────────────────────────
-    banner "TEST 3/6 — Fairvisor reverse_proxy (latency)"
-    start_backend
-    start_fairvisor "reverse_proxy" "${PD}/simple.json"
-    s_lat=$(   write_latency_js "lat_proxy" "${FV_URL}/" "${LATENCY_RPS}" "${LATENCY_DUR}" "${JWT}" "get")
-    s_warmup=$(write_warmup_js  "lat_proxy" "${FV_URL}/" "${JWT}")
-    run_latency_test "proxy" "${s_lat}" "${s_warmup}" "LAT_P"
-    stop_all
-
-    # ── TEST 4/6: Max throughput — simple policy ──────────────────────────────
-    banner "TEST 4/6 — Max throughput: simple rate limit (1 rule)"
-    start_backend
-    start_fairvisor "reverse_proxy" "${PD}/simple.json"
-    run_throughput_test "simple" "${FV_URL}/" "" "" "${TGT_T[simple]}"
-    stop_all
-
-    # ── TEST 5/6: Max throughput — complex policy ─────────────────────────────
-    banner "TEST 5/6 — Max throughput: complex policy (5 rules + JWT + loop)"
-    start_backend
-    start_fairvisor "reverse_proxy" "${PD}/complex.json"
-    run_throughput_test "complex" "${FV_URL}/" "${JWT}" "" "${TGT_T[complex]}"
-    stop_all
-
-    # ── TEST 6/6: Max throughput — LLM token estimation ──────────────────────
-    banner "TEST 6/6 — Max throughput: token estimation (tiktoken)"
-    start_backend
-    start_fairvisor "reverse_proxy" "${PD}/llm.json"
-    run_throughput_test "llm" "${FV_URL}/" "${JWT}" "${LLM_BODY}" "${TGT_T[llm]}"
-    stop_all
-
-    print_results
+    if remote_mode_enabled; then
+        controller_main
+    else
+        local_single_host_main
+    fi
 }
 
 main "$@"
