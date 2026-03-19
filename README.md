@@ -9,14 +9,13 @@ Script: `run-all.sh`
 
 ## What It Tests
 
-`run-all.sh` runs 6 scenarios:
+`run-all.sh` runs 5 scenarios:
 
 1. Raw nginx baseline latency (`:8082`)
 2. Fairvisor `decision_service` latency (`POST /v1/decision`)
 3. Fairvisor `reverse_proxy` latency
 4. Max throughput: simple policy (1 rule)
 5. Max throughput: complex policy (5 rules + JWT + loop detection)
-6. Max throughput: LLM token estimation policy (`token_bucket_llm`)
 
 Each run prints a summary table and stores raw artifacts.
 
@@ -122,29 +121,27 @@ On the local controller:
 
 ## Reference Results
 
-Measured on **AWS c7i.2xlarge** (8 vCPU, 16 GB RAM), **Ubuntu 24.04.3 LTS**.
+Measured on **2 × AWS c7i.xlarge** (4 vCPU, 8 GB RAM each), **cluster placement group**, **eu-central-1**, **Ubuntu 24.04 LTS**.
 k6 v0.54.0, constant-arrival-rate, 10 000 RPS / 60 s / 10 s warmup.
-CPU pinning: OpenResty on cores 0–3, k6 on cores 4–7.
+Fairvisor and k6 run on separate hosts.
 
 ### Latency @ 10 000 RPS
 
 | Percentile | Decision Service | Reverse Proxy | Raw nginx |
 |------------|-----------------|---------------|-----------|
-| p50        | 112 μs          | 241 μs        | 71 μs     |
-| p90        | 191 μs          | 376 μs        | 190 μs    |
-| p99        | 426 μs          | 822 μs        | 446 μs    |
-| p99.9      | 2 990 μs        | 2 980 μs      | 1 610 μs  |
+| p50        | 304 μs          | 302 μs        | 235 μs    |
+| p90        | 543 μs          | 593 μs        | 409 μs    |
+| p99        | 2 000 μs        | 1 790 μs      | 1 950 μs  |
+| p99.9      | 4 000 μs        | 5 120 μs      | 3 620 μs  |
 
-### Max Sustained Throughput — single instance
+### Max Sustained Throughput
 
-| Configuration                              | RPS     |
-|--------------------------------------------|---------|
-| Simple rate limit (1 rule)                 | 110 500 |
-| Complex policy (5 rules, JWT + loop detect)| 67 600  |
-| Token estimation (token_bucket_llm)        | 49 400  |
+| Configuration                               | RPS     |
+|---------------------------------------------|---------|
+| Simple rate limit (1 rule)                  | 195 000 |
+| Complex policy (5 rules, JWT + loop detect) | 195 000 |
 
-> Your numbers will vary by instance type and OS.
-> Use `results/reference.json` to compare programmatically.
+> Your numbers will vary by instance type, network topology, and OS.
 
 ## Notes on Interpretation
 
